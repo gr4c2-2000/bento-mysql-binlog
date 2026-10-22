@@ -14,8 +14,8 @@ import (
 )
 
 const (
-	startSaved   = "saved"
-	startCurrent = "current"
+	startSaved    = "saved"
+	startCurrent  = "current"
 	startEarliest = "earliest"
 )
 
@@ -39,7 +39,7 @@ type Input struct {
 // Connect opens the replication stream, resuming from the stored position when
 // there is one.
 func (in *Input) Connect(ctx context.Context) error {
-	start, err := in.startPosition()
+	stored, err := in.storedPosition()
 	if err != nil {
 		return err
 	}
@@ -47,6 +47,12 @@ func (in *Input) Connect(ctx context.Context) error {
 	c, err := canal.NewCanal(in.canalCfg)
 	if err != nil {
 		return fmt.Errorf("creating canal: %w", err)
+	}
+
+	start, err := in.startPosition(c, stored)
+	if err != nil {
+		c.Close()
+		return err
 	}
 
 	runCtx, cancel := context.WithCancel(context.Background())
@@ -61,19 +67,9 @@ func (in *Input) Connect(ctx context.Context) error {
 	go func() {
 		defer close(in.txns)
 
-		var runErr error
-		switch {
-		case start.Name != "":
-			in.logger.Infof("resuming replication from %s:%d", start.Name, start.Pos)
-			runErr = c.RunFrom(start)
-		case in.startFrom == startEarliest:
-			in.logger.Info("starting replication from the oldest retained binlog")
-			runErr = c.RunFrom(mysql.Position{Name: "", Pos: 4})
-		default:
-			in.logger.Info("starting replication from the current master position")
-			runErr = c.Run()
-		}
-
+		// An empty position means "whatever the server still has", which is
+		// how canal expresses starting from the oldest retained binlog.
+		runErr := c.RunFrom(start)
 		if runErr != nil && runCtx.Err() == nil {
 			select {
 			case in.errCh <- runErr:
@@ -85,7 +81,7 @@ func (in *Input) Connect(ctx context.Context) error {
 	return nil
 }
 
-func (in *Input) startPosition() (mysql.Position, error) {
+func (in *Input) storedPosition() (mysql.Position, error) {
 	if in.startFrom != startSaved {
 		return mysql.Position{}, nil
 	}
@@ -93,6 +89,29 @@ func (in *Input) startPosition() (mysql.Position, error) {
 	if err != nil {
 		return mysql.Position{}, fmt.Errorf("loading stored position: %w", err)
 	}
+	return pos, nil
+}
+
+// startPosition decides where replication begins. A committed position always
+// wins; otherwise `current` asks the server where its binlog is right now and
+// `earliest` leaves the position empty, which makes the server send everything
+// it still retains.
+func (in *Input) startPosition(c *canal.Canal, stored mysql.Position) (mysql.Position, error) {
+	if stored.Name != "" {
+		in.logger.Infof("resuming replication from %s:%d", stored.Name, stored.Pos)
+		return stored, nil
+	}
+
+	if in.startFrom == startEarliest {
+		in.logger.Info("starting replication from the oldest retained binlog")
+		return mysql.Position{}, nil
+	}
+
+	pos, err := c.GetMasterPos()
+	if err != nil {
+		return mysql.Position{}, fmt.Errorf("reading the current binlog position: %w", err)
+	}
+	in.logger.Infof("starting replication from the current position %s:%d", pos.Name, pos.Pos)
 	return pos, nil
 }
 
@@ -170,7 +189,7 @@ func (in *Input) next(ctx context.Context, deadline <-chan time.Time) (txn, erro
 func appendEvents(batch service.MessageBatch, events []Event) service.MessageBatch {
 	for _, ev := range events {
 		msg := service.NewMessage(nil)
-		msg.SetStructured(ev)
+		msg.SetStructured(ev.AsStructured())
 		msg.MetaSetMut("db", ev.Schema)
 		msg.MetaSetMut("table", ev.Table)
 		msg.MetaSetMut("action", ev.Action)

@@ -3,8 +3,11 @@ package binlog
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/warpstreamlabs/bento/public/bloblang"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/warpstreamlabs/bento/public/service"
@@ -224,5 +227,64 @@ func TestReadBatchHonoursContextCancellation(t *testing.T) {
 
 	if _, _, err := in.ReadBatch(ctx); !errors.Is(err, context.Canceled) {
 		t.Fatalf("want context.Canceled, got %v", err)
+	}
+}
+
+// A Go struct set as the payload is invisible to Bloblang, so filters like
+// `this.after.amount > 1000` would silently match nothing.
+func TestBatchPayloadIsQueryableByBloblang(t *testing.T) {
+	batch := appendEvents(nil, []Event{{
+		Schema: "shop", Table: "orders", Action: "update",
+		Before: map[string]any{"id": int64(7), "amount": "10.50"},
+		After:  map[string]any{"id": int64(7), "amount": "2000.00"},
+		File:   "mysql-bin.000001", Pos: 12,
+	}})
+
+	for _, tc := range []struct{ mapping, want string }{
+		{`root = this.after.id`, "7"},
+		{`root = this.action`, "update"},
+		{`root = this.before.amount`, "10.50"},
+		{`root = if this.after.amount.number() < 1000 { "dropped" } else { "kept" }`, "kept"},
+	} {
+		exe, err := bloblang.GlobalEnvironment().Parse(tc.mapping)
+		if err != nil {
+			t.Fatalf("parse %q: %v", tc.mapping, err)
+		}
+		res, err := batch[0].BloblangQuery(exe)
+		if err != nil {
+			t.Fatalf("query %q: %v", tc.mapping, err)
+		}
+		got, err := res.AsBytes()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != tc.want {
+			t.Errorf("%s = %q, want %q", tc.mapping, got, tc.want)
+		}
+	}
+}
+
+// The JSON that reaches a sink must keep the documented shape.
+func TestBatchPayloadSerialisesToDocumentedJSON(t *testing.T) {
+	batch := appendEvents(nil, []Event{{
+		Schema: "shop", Table: "orders", Action: "insert",
+		After: map[string]any{"id": int64(7)},
+		File:  "mysql-bin.000001", Pos: 12, TsUnix: 1700000000,
+	}})
+
+	raw, err := batch[0].AsBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`"schema":"shop"`, `"table":"orders"`, `"action":"insert"`,
+		`"after":{"id":7}`, `"file":"mysql-bin.000001"`, `"pos":12`, `"ts_unix":1700000000`,
+	} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("payload %s is missing %s", raw, want)
+		}
+	}
+	if strings.Contains(string(raw), `"before"`) {
+		t.Errorf("empty before image should be omitted: %s", raw)
 	}
 }

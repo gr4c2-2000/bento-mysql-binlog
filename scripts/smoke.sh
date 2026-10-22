@@ -45,12 +45,16 @@ RABBIT_WANT=2
 kafka_dump() {
   "${COMPOSE[@]}" exec -T kafka /opt/kafka/bin/kafka-console-consumer.sh \
     --bootstrap-server localhost:9092 --topic shop.orders \
-    --from-beginning --timeout-ms 5000 2>/dev/null || true
+    --from-beginning --timeout-ms 5000 \
+    --property print.key=true --property key.separator='|' 2>/dev/null || true
 }
 
 rabbit_count() {
-  curl -fsS -u guest:guest "$RABBIT_API/queues/%2F/shop.deletes" \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)["messages"])'
+  # The queue may not have been published to yet; treat any hiccup as zero and
+  # let the polling loop retry.
+  curl -fsS -u guest:guest "$RABBIT_API/queues/%2F/shop.deletes" 2>/dev/null \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("messages", 0))' 2>/dev/null \
+    || echo 0
 }
 
 log "Waiting for both sinks"
@@ -68,6 +72,7 @@ printf '%s\n' "$KAFKA_OUT"
 [[ "$KAFKA_GOT" -eq "$KAFKA_WANT" ]] || fail "Kafka: want $KAFKA_WANT messages, got $KAFKA_GOT"
 grep -q '"table":"customers"' <<<"$KAFKA_OUT" && fail "Kafka received customers rows"
 grep -q '"schema":"ops"' <<<"$KAFKA_OUT" && fail "Kafka received rows from a table outside include_tables"
+grep -q '^null|' <<<"$KAFKA_OUT" && fail "Kafka message key interpolation produced null"
 
 log "RabbitMQ queue shop.deletes"
 RABBIT_BODY="$(curl -fsS -u guest:guest -H 'content-type: application/json' \

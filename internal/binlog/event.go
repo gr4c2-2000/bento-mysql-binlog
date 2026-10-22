@@ -19,6 +19,28 @@ type Event struct {
 	TsUnix uint32         `json:"ts_unix"`
 }
 
+// AsStructured renders the event the way Bloblang and the output codecs see
+// it. A Go struct set as a message payload is opaque to Bloblang - mappings
+// such as `this.after.amount` would silently evaluate to null - so the payload
+// has to be a plain map.
+func (e Event) AsStructured() map[string]any {
+	m := map[string]any{
+		"schema":  e.Schema,
+		"table":   e.Table,
+		"action":  e.Action,
+		"file":    e.File,
+		"pos":     e.Pos,
+		"ts_unix": e.TsUnix,
+	}
+	if e.Before != nil {
+		m["before"] = e.Before
+	}
+	if e.After != nil {
+		m["after"] = e.After
+	}
+	return m
+}
+
 // EventsFrom converts a canal rows event into one Event per changed row.
 //
 // Update events carry their rows as [before, after] pairs, so a single rows
