@@ -1,0 +1,38 @@
+{
+  "vhosts": [{ "name": "/" }],
+  "exchanges": [
+    {
+      "name": "shop.events",
+      "vhost": "/",
+      "type": "topic",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false,
+      "arguments": {}
+    }
+  ],
+  "queues": [
+    {
+      "name": "shop.deletes",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {}
+    }
+  ],
+  "bindings": [
+    {
+      "source": "shop.events",
+      "vhost": "/",
+      "destination": "shop.deletes",
+      "destination_type": "queue",
+      "routing_key": "shop.#",
+      "arguments": {}
+    }
+  ],
+  "users": [],
+  "permissions": [],
+  "policies": [],
+  "parameters": [],
+  "global_parameters": []
+}

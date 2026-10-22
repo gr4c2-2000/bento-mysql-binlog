@@ -1,0 +1,50 @@
+# One binlog stream, two sinks, different filters on each.
+#
+#   mysql_binlog ──┬─ table == orders ──────────> Kafka  shop.orders
+#                  └─ action == delete ─────────> RabbitMQ shop.events -> shop.deletes
+#
+# fan_out hands every message to both branches, so a delete on shop.orders
+# legitimately lands in both. A batch is only acknowledged - and the binlog
+# position only committed - once both sinks have accepted it.
+
+input:
+  mysql_binlog:
+    addr: mysql:3306
+    user: repl
+    password: replpass
+    server_id: 1001
+    include_tables: [ 'shop\..*' ]
+    position_file: /var/lib/bento/binlog.pos
+    max_batch_rows: 100
+    max_batch_wait: 500ms
+
+output:
+  broker:
+    pattern: fan_out
+    outputs:
+      - label: kafka_orders
+        processors:
+          - mapping: root = if meta("table") != "orders" { deleted() }
+        kafka_franz:
+          seed_brokers: [ "kafka:9092" ]
+          topic: shop.orders
+          key: '${! json("after.id").or(json("before.id")).string() }'
+          max_in_flight: 1
+
+      - label: rabbit_deletes
+        processors:
+          - mapping: root = if meta("action") != "delete" { deleted() }
+        amqp_0_9:
+          urls: [ "amqp://guest:guest@rabbitmq:5672/" ]
+          exchange: shop.events
+          key: 'shop.${! meta("table") }.deleted'
+          content_type: application/json
+          max_in_flight: 1
+
+logger:
+  level: INFO
+  format: logfmt
+
+http:
+  enabled: true
+  address: 0.0.0.0:4195
